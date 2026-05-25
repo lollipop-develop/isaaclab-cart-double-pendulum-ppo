@@ -70,10 +70,17 @@ class CartDoublePendulumEnvCfg(DirectRLEnvCfg):
 
     # Initial joint angles, multiplied by pi internally. At joint angle 0 the
     # links point UP (the asset is an *inverted* double pendulum).
-    # SWING-UP DEFAULT: link-1 hangs down (theta1 ~ pi); link-2 aligned with
-    # link-1 (theta2 ~ 0, i.e. both hanging straight down).
-    initial_pole_angle_range = [0.95, 1.05]       # link-1 ~ pi +/- 0.05*pi
-    initial_pendulum_angle_range = [-0.05, 0.05]  # link-2 ~ 0 +/- 0.05*pi
+    #
+    # V2 CURRICULUM: random initial angles across the full ±π range. The
+    # policy now sees the balance problem (near-upright starts) from the very
+    # first iter, while still seeing swing-up problems (hanging starts) too.
+    # This implicit curriculum bootstraps the harder skill (swing-up) from the
+    # easier one (balance), which random hanging-only starts can't do.
+    initial_pole_angle_range = [-1.0, 1.0]        # link-1 ~ uniform[-π, +π]
+    initial_pendulum_angle_range = [-1.0, 1.0]    # link-2 ~ uniform[-π, +π]
+    # ORIGINAL (main branch): hanging only
+    # initial_pole_angle_range = [0.95, 1.05]
+    # initial_pendulum_angle_range = [-0.05, 0.05]
 
     # Link-1 termination angle. SWING-UP: huge so it never triggers (the links
     # sweep the full range). For a balance task, set this to math.pi / 2.
@@ -168,55 +175,36 @@ class CartDoublePendulumEnv(DirectRLEnv):
         # Absolute angle of link-2 from vertical = theta1 + theta2.
         theta2_abs = pole_pos + pend_pos
 
-        # --- SWING-UP DEFAULT --------------------------------------------
-        # cos(angle) is +1 when a link points up, -1 when it hangs down.
-        # Both links up -> r_upright = +2.
+        # --- V2 REWARD: energy-shaping + smooth proximity ---------------
+        # Three crisp terms, each with one clear job:
         #
-        # History: a previous version weighted link-1 3× link-2 (1.5/0.5) to
-        # break a local-optimum trap where the policy aligned link-2 along
-        # link-1 (θ₂=0) without ever swinging link-1 up — symmetric weights
-        # collapse to 2·cos(θ₁) when θ₂=0, giving half the max reward for free.
-        # That asymmetric weighting did its job (link-1 swing-up was learned),
-        # but capped the policy at ≈+300 ep_return because the link-2 gradient
-        # was too weak. Phase B (this commit) restores symmetric weights now
-        # that the policy already keeps link-1 upright; the old shortcut is no
-        # longer attractive because the policy would lose 1.0/step on link-1
-        # for only 1.0/step gain from link-2 alignment (net zero), and lifting
-        # link-2 properly now yields a clean +1.0/step gain on top.
-        r_upright = torch.cos(pole_pos) + torch.cos(theta2_abs)
-        both_up = (torch.cos(pole_pos) > 0.95) & (torch.cos(theta2_abs) > 0.95)
-        # NOTE: keep this coefficient small (-0.1). Larger values (e.g. -0.5)
-        # cause the policy to "crawl" — moving fast through upright costs
-        # hundreds of points (v² scales quickly), so the policy gives up on
-        # real swing-up and tries to quasi-statically align the pendulum.
-        r_at_top_slow = both_up.float() * (-0.1 * (pole_vel.pow(2) + pend_vel.pow(2)))
-        # Explicit +1/step bonus for being tightly upright. Without this the
-        # cos shaping flattens near the top and the policy has no strong
-        # gradient pulling it to "stay" once it gets there.
-        r_stay_at_top = both_up.float() * 2.0
-        # Smooth "catch at top" reward. Peak +3/step when BOTH links are near
-        # upright AND moving slowly; decays smoothly with either deviation or
-        # velocity. Designed for the "swings through upright continuously, never
-        # stops" failure mode: provides a gradient from "passing fast" -> "passing
-        # slow" -> "stopping near top" without any cliff. (1 - cos(θ)) is a
-        # bounded smooth angle-deviation measure (0 at upright, 2 at hanging).
+        # r_energy:   penalise being away from the upright-rest energy E*.
+        #             Gives directional gradient EVERYWHERE — pump KE when
+        #             low (cart accelerates), brake when high. No local-
+        #             optimum trap because every non-upright-rest state has
+        #             a non-zero energy error pointing the right way.
+        # r_proximity: smooth Gaussian that disambiguates "right energy at
+        #              the bottom" from "right energy at the top." Only
+        #              non-zero near upright AND slow — gives the catch.
+        # r_cart_bound: same 4th-power soft wall as main branch.
+        # r_terminate:  same small terminal penalty.
+        #
+        # Note this is a PROXY for the true mechanical energy — the cos and
+        # joint-velocity terms have the right shape but are not in SI units.
+        # The target E_proxy = +2 (PE proxy at upright, KE = 0) is what the
+        # squared penalty drives toward.
+        PE_proxy = torch.cos(pole_pos) + torch.cos(theta2_abs)        # in [-2, +2]
+        KE_proxy = pole_vel.pow(2) + pend_vel.pow(2)                  # >= 0
+        E_proxy = PE_proxy + 0.05 * KE_proxy                          # 0.05 weights KE relative to PE
+        r_energy = -0.5 * (E_proxy - 2.0).pow(2)
+
         dev_sq = (1.0 - torch.cos(pole_pos)).pow(2) + (1.0 - torch.cos(theta2_abs)).pow(2)
-        vel_sq = pole_vel.pow(2) + pend_vel.pow(2)
-        r_catch = 3.0 * torch.exp(-dev_sq / 0.5) * torch.exp(-vel_sq / 5.0)
-        r_cart_center = -0.01 * cart_pos.pow(2)
-        # Smooth boundary repulsion: ~0 in the middle, ramps up sharply near
-        # ±max_cart_pos. 4th power keeps it tiny for moderate swings (e.g. at
-        # cart=±3.5 of 7 it's just -0.03) but lethal near the bound (-0.5
-        # at exactly the wall). Pulls the cart back BEFORE termination triggers.
-        r_cart_bound_proximity = -0.5 * (cart_pos / self.cfg.max_cart_pos).pow(4)
-        # r_cart_quiet = -0.005 * cart_vel.abs()
-        # Was -10.0; reduced so the policy stops fearing the cart bound
-        # and can explore swinging the cart through ±max_cart_pos for energy pumping.
+        r_proximity = 3.0 * torch.exp(-dev_sq / 0.5) * torch.exp(-KE_proxy / 5.0)
+
+        r_cart_bound = -0.5 * (cart_pos / self.cfg.max_cart_pos).pow(4)
         r_terminate = -1.0 * terminated
-        reward = (
-            r_upright + r_at_top_slow + r_stay_at_top + r_catch
-            + r_cart_center + r_cart_bound_proximity + r_terminate
-        )
+
+        reward = r_energy + r_proximity + r_cart_bound + r_terminate
         # -----------------------------------------------------------------
 
         # --- VARIANT: sparse (reward only when both links are near upright)
