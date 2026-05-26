@@ -175,28 +175,26 @@ class CartDoublePendulumEnv(DirectRLEnv):
         # Absolute angle of link-2 from vertical = theta1 + theta2.
         theta2_abs = pole_pos + pend_pos
 
-        # --- V2 REWARD: energy-shaping + smooth proximity ---------------
-        # Three crisp terms, each with one clear job:
+        # --- V2 REWARD: PE-only quadratic shaping + smooth proximity ----
+        # Four crisp terms; each has one clear job and no exploit surface:
         #
-        # r_energy:   penalise being away from the upright-rest energy E*.
-        #             Gives directional gradient EVERYWHERE — pump KE when
-        #             low (cart accelerates), brake when high. No local-
-        #             optimum trap because every non-upright-rest state has
-        #             a non-zero energy error pointing the right way.
-        # r_proximity: smooth Gaussian that disambiguates "right energy at
-        #              the bottom" from "right energy at the top." Only
-        #              non-zero near upright AND slow — gives the catch.
-        # r_cart_bound: same 4th-power soft wall as main branch.
-        # r_terminate:  same small terminal penalty.
-        #
-        # Note this is a PROXY for the true mechanical energy — the cos and
-        # joint-velocity terms have the right shape but are not in SI units.
-        # The target E_proxy = +2 (PE proxy at upright, KE = 0) is what the
-        # squared penalty drives toward.
+        # r_energy:   quadratic penalty on (PE_proxy - 2)². Monotone gradient
+        #             from hanging (-8) → horizontal (-2) → upright (0). The
+        #             only way to drive this term up is to ACTUALLY raise the
+        #             links. PE-only deliberately — earlier attempts that
+        #             added KE into the target (E_proxy = PE + α·KE) let the
+        #             policy "fake the right energy" by spinning fast at the
+        #             bottom (PE=-2 + α·v² = 2). Removing KE from the target
+        #             closes that loophole.
+        # r_proximity: smooth Gaussian that activates only near upright AND
+        #              slow. Provides the "catch at the top" gradient. KE
+        #              still appears here as a damping factor — high speed at
+        #              upright is NOT rewarded.
+        # r_cart_bound: 4th-power soft wall.
+        # r_terminate:  small terminal penalty.
         PE_proxy = torch.cos(pole_pos) + torch.cos(theta2_abs)        # in [-2, +2]
         KE_proxy = pole_vel.pow(2) + pend_vel.pow(2)                  # >= 0
-        E_proxy = PE_proxy + 0.05 * KE_proxy                          # 0.05 weights KE relative to PE
-        r_energy = -0.5 * (E_proxy - 2.0).pow(2)
+        r_energy = -0.5 * (PE_proxy - 2.0).pow(2)
 
         dev_sq = (1.0 - torch.cos(pole_pos)).pow(2) + (1.0 - torch.cos(theta2_abs)).pow(2)
         r_proximity = 3.0 * torch.exp(-dev_sq / 0.5) * torch.exp(-KE_proxy / 5.0)
